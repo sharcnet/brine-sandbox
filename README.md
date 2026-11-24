@@ -8,11 +8,12 @@ Short version of when to use it: it's for "I want an agent on my laptop and I do
 
 You need Linux with kernel 6.7 or newer, Node.js, and curl. [Platforms](#platforms) has the details.
 
-1. **Install nono 0.82.0.** Download the release tarball for your platform from the [v0.82.0 release](https://github.com/nolabs-ai/nono/releases/tag/v0.82.0) and check where it came from:
+1. **Install nono 0.82.0.** On ARM, swap `x86_64` for `aarch64`:
    ```
-   gh attestation verify nono-v0.82.0-x86_64-unknown-linux-gnu.tar.gz --repo nolabs-ai/nono
+   mkdir -p ~/.local/bin
+   curl -fsSL https://github.com/nolabs-ai/nono/releases/download/v0.82.0/nono-v0.82.0-x86_64-unknown-linux-gnu.tar.gz | tar xz -C ~/.local/bin nono
    ```
-   That checks GitHub's signed build provenance for the release workflow, and needs `gh` 2.49 or newer. nono doesn't publish detached signatures, and the release's `SHA256SUMS.txt` sits next to the files it describes, so it only catches a broken download. Extract `nono` from the tarball and put it on your `PATH`. The launcher refuses any binary whose sha256 isn't one of the pinned tarball builds, so the release's `.deb` and `.rpm` packages aren't supported. [Upgrading nono](#upgrading-nono) covers moving to a new one.
+   You don't need to verify it yourself. The launcher refuses to run any nono whose sha256 doesn't match the release builds pinned in this repo.
 2. **Install Pi** from <https://pi.dev>. The managed installer and an npm global install both work.
 3. **Get this repo and put the launcher on your PATH:**
    ```
@@ -122,7 +123,7 @@ A sandbox with a filtering, key-injecting proxy is exactly what nono is. Rebuild
 
 That trust has limits:
 
-- **The binary is pinned.** The launcher checks nono's digest, not just its version string, and upgrades happen on purpose, after the checks pass. The digest pin only proves you're running what this repo was tested with. Where that binary came from rests on GitHub's build provenance, which is why setup verifies the attestation.
+- **The binary is pinned.** The launcher checks nono's digest, not just its version string, and upgrades happen on purpose, after the checks pass. The pinned digests are taken from releases whose GitHub build provenance was verified when the version was bumped.
 - **Behaviour is tested, not the documentation.** The checks try to break out and require specific evidence that they failed. They've already caught real gaps. The empty-`allow_domain` behaviour above isn't documented, the docs on nono's `main` branch describe features 0.82.0 doesn't have, a probe found that Landlock lets the agent change timestamps on files it can't write to, and the first review found the desktop session reachable over Unix sockets.
 - **The trusted part stays small.** No layer gets added unless a check shows it's needed.
 
@@ -130,8 +131,8 @@ nono is pre-1.0 and releases about every two weeks, so this is still a bet. It's
 
 ## Upgrading nono
 
-1. Download the new release, verify its attestation as in setup, and install it.
-2. Change `NONO_VERSION` at the top of `brine-sandbox`, and replace `NONO_SHA256` with the sha256 of the `nono` binary from each Linux tarball (`sha256sum nono` after extracting, not the tarball's own sum).
+1. Download each Linux tarball of the new release and verify where it came from with `gh attestation verify <tarball> --repo nolabs-ai/nono`. That checks GitHub's signed build provenance for nono's release workflow and needs `gh` 2.49 or newer (Ubuntu's packaged `gh` is older; get it from <https://cli.github.com>). nono publishes no detached signatures, and `SHA256SUMS.txt` only catches a broken download.
+2. Change `NONO_VERSION` at the top of `brine-sandbox`, and replace `NONO_SHA256` with the sha256 of the `nono` binary from each tarball (`sha256sum nono` after extracting, not the tarball's own sum).
 3. Run `brine-sandbox --check`. It must end with `All clear.` Read the release notes for anything touching networking, credentials, Unix sockets or Landlock.
 4. Only then commit the bump.
 
