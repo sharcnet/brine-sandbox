@@ -8,6 +8,9 @@
   "groups": {
     "include": ["node_runtime"]
   },
+  "linux": {
+    "af_unix_mediation": "pathname"
+  },
   "security": {
     "signal_mode": "isolated",
     "capability_elevation": false

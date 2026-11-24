@@ -2,30 +2,44 @@
 # Run the Pi coding agent in a nono sandbox that can reach Brine and nothing else.
 # Usage, from your project directory:
 #   brine-sandbox [pi args...]   start Pi (e.g. -p "..." for one-shot)
-#   brine-sandbox --check        run the escape probes; every line must say PASS
+#   brine-sandbox --check        run the escape checks; it must end with "All clear"
 set -eu
 
-NONO_VERSION=0.82.0 # the version probes.sh last passed against; bump only after it passes again
-
-repo=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
-config=${XDG_CONFIG_HOME:-$HOME/.config}/brine-sandbox
-state=${XDG_STATE_HOME:-$HOME/.local/state}/brine-sandbox
-keyfile=$config/brine.key
-here=$(pwd -P)
+# The nono release checks.mjs last passed against, and the sha256 of its binary from each
+# Linux release tarball (x86_64 gnu, x86_64 musl, aarch64 gnu). Bump only after --check passes.
+NONO_VERSION=0.82.0
+NONO_SHA256="a2d455be45f63c4c6ddabad6e3186fffae67fd7200a7c1ccb1a272fd32c83601
+60f5c8240da81b5b8b5cc440d8f010f8a7e862265a3251bbe65edc9297474909
+1abc7d0e94380e590aef6b75954a9af5072eddf469f4b38c99309b525a83a119"
 
 die() { printf 'brine-sandbox: %s\n' "$*" >&2; exit 1; }
+real() { readlink -m -- "$1"; }
 
-command -v nono >/dev/null || die "nono not found on PATH. See the README for how to install nono $NONO_VERSION."
-have=$(nono --version | awk '{print $2}')
-[ "$have" = "$NONO_VERSION" ] || die "nono $have is installed, but brine-sandbox is tested against $NONO_VERSION. See 'Upgrading nono' in the README."
-[ -s "$keyfile" ] || die "no Brine key at $keyfile. See the README for setup."
+# Every path is resolved before it's compared, so symlinked homes, XDG dirs and keys can't
+# slip past the guard below.
+home=$(real "$HOME")
+repo=$(real "$(dirname "$(real "$0")")")
+config=$(real "${XDG_CONFIG_HOME:-$HOME/.config}/brine-sandbox")
+state=$(real "${XDG_STATE_HOME:-$HOME/.local/state}/brine-sandbox")
+[ -s "$config/brine.key" ] || die "no Brine key at $config/brine.key. See the README for setup."
+keyfile=$(real "$config/brine.key")
+here=$(pwd -P)
 
-# The sandbox gets read/write on the current directory. Refuse any directory that would
-# hand it the key, the policy, this launcher, or your home directory.
-case $here in /|"$HOME") die "refusing to run in $here. cd into a project directory first." ;; esac
-for p in "$repo" "$config"; do
-  case $p/ in "$here"/*) die "refusing to run in $here: it contains $p." ;; esac
-  case $here/ in "$p"/*) die "refusing to run inside $p." ;; esac
+# Use the nono on PATH only if it's the exact pinned binary, and from then on by absolute path.
+nono=$(command -v nono) || die "nono not found on PATH. See the README for how to install nono $NONO_VERSION."
+nono=$(real "$nono")
+sum=$(sha256sum "$nono" | cut -d' ' -f1)
+printf '%s\n' "$NONO_SHA256" | grep -qx "$sum" ||
+  die "$nono is not the nono $NONO_VERSION release binary (sha256 $sum). See 'Upgrading nono' in the README."
+
+# The sandbox gets read/write on the current directory. Refuse any directory that would hand it
+# the key, the policy, this launcher, nono itself, other projects' Pi state, or your home.
+contains() { case $2/ in "$1"/*) return 0 ;; esac; return 1; }
+[ "$here" = / ] && die "refusing to run in /. cd into a project directory first."
+contains "$here" "$home" && die "refusing to run in $here: it contains your home directory."
+for p in "$repo" "$config" "$state" "$keyfile" "$nono"; do
+  contains "$here" "$p" && die "refusing to run in $here: it contains $p."
+  contains "$p" "$here" && die "refusing to run inside $p."
 done
 
 # Find Pi's install. Pi's managed installer keeps releases under ~/.pi, which also holds
@@ -38,28 +52,146 @@ if [ -r "$pi_home/current-version" ]; then
 else
   pi_bin=$(command -v pi) || die "pi not found. Install it from https://pi.dev first."
 fi
-pi_bin=$(readlink -f "$pi_bin")
+pi_bin=$(real "$pi_bin")
 pi_root=${pi_bin%/node_modules/*}/node_modules
 [ -d "$pi_root" ] || die "can't work out where Pi is installed from $pi_bin."
 command -v node >/dev/null || die "node not found on PATH."
+[ -d "$pi_node" ] && pi_node=$(real "$pi_node") || pi_node=
 
-# nono needs an absolute path for the key, so fill it into the profile here.
-# $config is never granted to the sandbox, so the agent can't edit the policy it runs under.
-mkdir -p "$config" "$state/pi"
-sed "s|@KEYFILE@|$keyfile|" "$repo/profile.json" >"$config/profile.json"
+# Each project gets its own Pi state: history, settings and extensions.
+name=$(basename "$here")
+pistate=$state/projects/$name-$(printf %s "$here" | sha256sum | cut -c1-12)
+mkdir -p "$pistate" "$config/nono"
 
-[ -d "$pi_node" ] || pi_node=
+# nono needs an absolute path for the key, so fill it into the profile here. $config is never
+# granted to the sandbox, so the agent can't edit the policy it runs under.
+tmp=$(mktemp "$config/profile.XXXXXX")
+sed "s|@KEYFILE@|$keyfile|" "$repo/profile.json" >"$tmp" && mv "$tmp" "$config/profile.json"
+
+# The sandbox's PATH. Entries under /tmp are dropped: the sandbox can't read them anyway, and
+# nono's --strict-broker-path refuses to start with a sandbox-writable directory on PATH.
+sandbox_path=
+IFS=:
+for d in $PATH; do
+  case $d in /tmp | /tmp/* | '' | [!/]*) ;; *) sandbox_path=${sandbox_path:+$sandbox_path:}$d ;; esac
+done
+unset IFS
+
+# nono starts from an empty environment plus this allowlist, so host credentials and NONO_*
+# variables can't reach it or the agent. XDG_CONFIG_HOME points nono at a private config dir so
+# a user profile named "default" can't replace the built-in one this policy extends.
 sandbox() {
-  exec nono run --profile "$config/profile.json" --allow-cwd --allow "$state/pi" --read "$pi_root" \
-    ${pi_node:+--read} ${pi_node:+"$pi_node"} "$@"
+  env -i HOME="$HOME" PATH="$sandbox_path" TERM="${TERM:-dumb}" LANG="${LANG:-C.UTF-8}" \
+    ${COLORTERM:+COLORTERM="$COLORTERM"} XDG_CONFIG_HOME="$config/nono" \
+    PI_CODING_AGENT_DIR="$pistate" PI_OFFLINE=1 PI_TELEMETRY=0 \
+    "$nono" run --strict-broker-path --profile "$config/profile.json" --allow-cwd --allow "$pistate" \
+    --read "$pi_root" ${pi_node:+--read} ${pi_node:+"$pi_node"} "$@"
 }
 
-if [ "${1-}" = --check ]; then
-  export BRINE_SANDBOX_KEYFILE="$keyfile" BRINE_SANDBOX_CONFIG="$config" BRINE_SANDBOX_REPO="$repo"
-  sandbox -s --read-file "$repo/probes.sh" -- sh "$repo/probes.sh"
-fi
+check() {
+  fix=$(mktemp -d "$state/check.XXXXXX")
+  other=$state/projects/check-other-${fix##*.}
+  tmpsecret=$(mktemp /tmp/brine-sandbox-check.XXXXXX)
+  server=
+  trap 'kill $server 2>/dev/null; rm -rf "$fix" "$other" "$tmpsecret"' EXIT
+  trap 'exit 130' INT TERM
 
-# setup-pi.mjs runs inside the sandbox: it asks Brine (through nono) for the model list and
-# points Pi at this session's proxy port, then hands over to Pi.
-export PI_CODING_AGENT_DIR="$state/pi" PI_OFFLINE=1 PI_TELEMETRY=0
-sandbox --read-file "$repo/setup-pi.mjs" -- sh -c 'node "$0" && exec "$@"' "$repo/setup-pi.mjs" "$pi_bin" "$@"
+  # Fixtures: a canary credential in places the agent must not reach, and live receivers.
+  canary=$(od -An -tx1 -N16 /dev/urandom | tr -d ' \n')
+  mkdir -p "$other/sessions" "$other/extensions"
+  for f in "$fix/secret" "$tmpsecret" "$other/sessions/canary.jsonl"; do printf '%s\n' "$canary" >"$f"; done
+  node "$repo/checks.mjs" serve "$fix" &
+  server=$!
+  i=0
+  until [ -s "$fix/receivers.json" ]; do
+    i=$((i + 1)) && [ $i -le 50 ] || die "the check's receivers didn't start."
+    sleep 0.1
+  done
+
+  # Host session sockets, checked live when present.
+  bus=${DBUS_SESSION_BUS_ADDRESS-}
+  bus=${bus#unix:path=} && bus=${bus%%,*}
+  wayland=${WAYLAND_DISPLAY:-wayland-0}
+  case $wayland in /*) ;; *) wayland=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$wayland ;; esac
+  x11=${DISPLAY-}
+  x11=${x11#*:} && x11=/tmp/.X11-unix/X${x11%%.*}
+
+  params=$(
+    CANARY_HASH=$(printf %s "$canary" | sha256sum | cut -d' ' -f1) FIX="$fix" TMPSECRET="$tmpsecret" OTHER="$other" \
+      KEYFILE="$keyfile" HOME_DIR="$home" POLICY="$config/profile.json" LAUNCHER="$repo/brine-sandbox" \
+      BUS="${bus:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/bus}" AGENT="${SSH_AUTH_SOCK-}" WAYLAND="$wayland" X11="$x11" \
+      node -e '
+        const e = process.env, fs = require("fs"), sock = (f) => !!f && fs.existsSync(f) && fs.statSync(f).isSocket();
+        const sockets = [["the session bus", e.BUS], ["the SSH agent", e.AGENT], ["the Wayland display", e.WAYLAND], ["the X11 display", e.X11]];
+        console.log(JSON.stringify({
+          canaryHash: e.CANARY_HASH, fixtures: JSON.parse(fs.readFileSync(e.FIX + "/receivers.json")),
+          secret: e.FIX + "/secret", tmpSecret: e.TMPSECRET, otherSession: e.OTHER + "/sessions/canary.jsonl",
+          otherExtensions: e.OTHER + "/extensions", keyfile: e.KEYFILE, home: e.HOME_DIR, policy: e.POLICY,
+          launcher: e.LAUNCHER, piAuth: e.HOME_DIR + "/.pi/agent/auth.json", ssh: e.HOME_DIR + "/.ssh",
+          hostSockets: sockets.map(([n, f]) => [n, f || "", sock(f)]),
+          present: { piAuth: fs.existsSync(e.HOME_DIR + "/.pi/agent/auth.json"), ssh: fs.existsSync(e.HOME_DIR + "/.ssh") },
+        }));'
+  )
+
+  # Dummy host credentials and NONO_* variables that would widen the sandbox if they got
+  # through. The control run sees them; the sandbox must not.
+  export AWS_SECRET_ACCESS_KEY="$canary" GITHUB_TOKEN="$canary" OPENAI_API_KEY="$canary"
+  export NONO_ALLOW="$fix" NONO_ALLOW_DOMAIN=example.com NONO_CAPABILITY_ELEVATION=true
+
+  bad=0
+  run() { # run <title> <cmd...>: print the output with the canary masked, and record failures
+    printf '\n== %s\n' "$1"
+    shift
+    out=$("$@" 2>&1) || bad=1
+    case $out in *"$canary"*) bad=1 && echo "FAIL the canary appeared in this output" ;; esac
+    # -f keeps the real key off grep's command line, where other processes could see it.
+    printf '%s\n' "$out" | grep -qF -f "$keyfile" && bad=1 && out="FAIL the real Brine key appeared in this output"
+    printf '%s\n' "$out" | sed "s/$canary/<canary>/g"
+  }
+  run "Control, outside the sandbox: every probe must reach its target" \
+    node "$repo/checks.mjs" probe control "$params"
+  run "Sandbox, as Pi runs: every probe must be denied" \
+    sandbox -s --read-file "$repo/checks.mjs" -- node "$repo/checks.mjs" probe sandbox "$params"
+  run "Widened sandbox, fixture secret and socket granted on purpose: both must be caught" \
+    sandbox -s --read-file "$repo/checks.mjs" --read-file "$fix/secret" --allow-unix-socket "$(node -p 'JSON.parse(process.argv[1]).fixtures.sock' "$params")" \
+    -- node "$repo/checks.mjs" probe widened "$params"
+
+  printf '\n== Receivers\n'
+  for k in tcp udp unix abstract; do
+    grep -qx "$k control" "$fix/hits" && echo "PASS $k receiver heard the control run" || { echo "FAIL $k receiver never heard the control run" && bad=1; }
+  done
+  if grep -q ' sandbox$' "$fix/hits"; then echo "FAIL a receiver heard from inside the sandbox" && bad=1; else echo "PASS no receiver heard from inside the sandbox"; fi
+
+  printf '\n== Setup\nkernel %s, nono %s (sha256 %s), Pi %s\n' "$(uname -r)" "$NONO_VERSION" "$sum" "$pi_bin"
+  env -i HOME="$HOME" PATH=/usr/bin:/bin NO_COLOR=1 "$nono" setup --check-only 2>&1 | grep -E 'Landlock V' || true
+  printf '\n== Effective grants for Pi in this directory\n'
+  NO_COLOR=1 sandbox --dry-run -v --read-file "$repo/brine-provider.mjs" -- "$pi_bin" 2>&1 | grep -E '^ +(r|w|r\+w|sock|net) |abstract-unix-socket'
+  [ $bad -eq 0 ] && echo "All clear." && exit 0
+  echo "NOT all clear. Don't use brine-sandbox on this machine until every line above passes." && exit 1
+}
+
+[ "${1-}" = --check ] && check
+
+# Git config and hooks in the project run as you, outside the sandbox, the next time a shell
+# prompt or editor runs git here. Snapshot them now and compare when Pi exits.
+git_state() {
+  find . -path '*/.git/objects' -prune -o \( -name .git -o -path '*/.git/config' -o -path '*/.git/config.worktree' \
+    -o -path '*/.git/commondir' -o -path '*/.git/hooks/*' -o -path '*/.git/info/*' \) ! -type d \
+    -printf '%m %p -> %l\n' -exec sha256sum {} \; 2>/dev/null | LC_ALL=C sort
+}
+before=$(git_state)
+trap : INT # Pi handles Ctrl-C; keep this shell alive to run the check below
+status=0
+sandbox -s --read-file "$repo/brine-provider.mjs" -- "$pi_bin" -e "$repo/brine-provider.mjs" "$@" || status=$?
+after=$(git_state)
+if [ "$before" != "$after" ]; then
+  printf '\nbrine-sandbox: WARNING: Git config or hooks changed during this session:\n' >&2
+  tmp=$(mktemp "$config/git.XXXXXX")
+  printf '%s\n' "$before" >"$tmp"
+  printf '%s\n' "$after" | diff "$tmp" - | sed -n 's/^[<>] [^ ]*  *\(\.[^ ]*\).*/  \1/p' | LC_ALL=C sort -u >&2
+  rm -f "$tmp"
+  printf '%s\n' "Your shell prompt or editor may run these as you as soon as it next runs git here." \
+    "Inspect them (e.g. cat .git/config) from another terminal before continuing." >&2
+  [ -t 0 ] && printf 'Press Enter to return to your shell. ' >&2 && read -r _
+fi
+exit $status
