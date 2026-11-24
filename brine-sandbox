@@ -2,7 +2,7 @@
 # Run the Pi coding agent in a nono sandbox that can reach Brine and nothing else.
 # Usage, from your project directory:
 #   brine-sandbox [pi args...]   start Pi (e.g. -p "..." for one-shot)
-#   brine-sandbox --check        run the escape checks; it must end with "All clear"
+#   brine-sandbox --check        run the escape checks; review the final result and any optional skips
 set -eu
 
 # The nono release checks.mjs last passed against, and the sha256 of its binary from each
@@ -139,10 +139,15 @@ check() {
   export NONO_ALLOW="$fix" NONO_ALLOW_DOMAIN=example.com NONO_CAPABILITY_ELEVATION=true
 
   bad=0
+  skipped=0
   run() { # run <title> <cmd...>: print the output with the canary masked, and record failures
     printf '\n== %s\n' "$1"
     shift
     out=$("$@" 2>&1) || bad=1
+    if [ "$1" = sandbox ] && [ "$2" = -s ]; then
+      skips=$(printf '%s\n' "$out" | awk '/^SKIP / {n++} END {print n+0}')
+      skipped=$((skipped + skips))
+    fi
     case $out in *"$canary"*) bad=1 && echo "FAIL the canary appeared in this output" ;; esac
     # -f keeps the real key off grep's command line, where other processes could see it.
     printf '%s\n' "$out" | grep -qF -f "$keyfile" && bad=1 && out="FAIL the real Brine key appeared in this output"
@@ -166,7 +171,10 @@ check() {
   env -i HOME="$HOME" PATH=/usr/bin:/bin NO_COLOR=1 "$nono" setup --check-only 2>&1 | grep -E 'Landlock V' || true
   printf '\n== Effective grants for Pi in this directory\n'
   NO_COLOR=1 sandbox --dry-run -v --read-file "$repo/brine-provider.mjs" -- "$pi_bin" 2>&1 | grep -E '^ +(r|w|r\+w|sock|net) |abstract-unix-socket'
-  [ $bad -eq 0 ] && echo "All clear." && exit 0
+  if [ "$bad" -eq 0 ]; then
+    printf 'All required checks passed. Optional checks skipped: %s.\n' "$skipped"
+    exit 0
+  fi
   echo "NOT all clear. Don't use brine-sandbox on this machine until every line above passes." && exit 1
 }
 

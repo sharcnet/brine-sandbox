@@ -26,7 +26,7 @@ You need Linux with kernel 6.7 or newer, Node.js, and curl. [Platforms](#platfor
    install -m 600 /dev/null ~/.config/brine-sandbox/brine.key
    $EDITOR ~/.config/brine-sandbox/brine.key
    ```
-5. **Run the checks once** from any project directory. It has to end with `All clear.` before you trust it on this machine:
+5. **Run the checks once** from any project directory. Check that all required checks passed. The summary counts optional checks skipped because their targets were absent:
    ```
    cd ~/some-project
    brine-sandbox --check
@@ -104,10 +104,6 @@ In nono 0.82.0 an empty `allow_domain` list leaves the network fully open, even 
 - **No PID or network namespace.** The agent can see your process list, including other processes' command-line arguments, though not their environment or memory. Don't pass secrets on command lines while it runs.
 - **Shared kernel.** This is a sandbox on your own kernel, not a VM. A kernel bug or a nono bug could break it. That's the trust question below.
 
-### Open question: upstream redirection
-
-nono only lets `POST /chat/completions` through, but it doesn't look at the request body. If Brine honours client-supplied options that change where it sends a request (LiteLLM's `api_base` is the usual example), the agent could point Brine at a server of its choosing. We haven't confirmed Brine's behaviour with its administrators yet, so there's no check for it. Once the behaviour is agreed, it gets a controlled regression check in `checks.mjs`.
-
 ## Trusting nono
 
 The agent is untrusted. It's a model generating commands as it goes, steered by whatever text ends up in front of it, so brine-sandbox doesn't rely on it behaving well. It contains it instead.
@@ -133,12 +129,12 @@ nono is pre-1.0 and releases about every two weeks, so this is still a bet. It's
 
 1. Download each Linux tarball of the new release and verify where it came from with `gh attestation verify <tarball> --repo nolabs-ai/nono`. That checks GitHub's signed build provenance for nono's release workflow and needs `gh` 2.49 or newer (Ubuntu's packaged `gh` is older; get it from <https://cli.github.com>). nono publishes no detached signatures, and `SHA256SUMS.txt` only catches a broken download.
 2. Change `NONO_VERSION` at the top of `brine-sandbox`, and replace `NONO_SHA256` with the sha256 of the `nono` binary from each tarball (`sha256sum nono` after extracting, not the tarball's own sum).
-3. Run `brine-sandbox --check`. It must end with `All clear.` Read the release notes for anything touching networking, credentials, Unix sockets or Landlock.
+3. Run `brine-sandbox --check`. All required checks must pass. Read the release notes for anything touching networking, credentials, Unix sockets or Landlock.
 4. Only then commit the bump.
 
 ## Platforms
 
-- **Linux**: tested on Ubuntu 24.04, kernel 7.0, where nono reports Landlock V8 and enforces V6. nono needs Landlock ABI v4, so kernel 6.7 or newer, to restrict TCP. Run `brine-sandbox --check` on any new machine, and don't use it there unless it ends with `All clear.`
+- **Linux**: tested on Ubuntu 24.04, kernel 7.0, where nono reports Landlock V8 and enforces V6. nono needs Landlock ABI v4, so kernel 6.7 or newer, to restrict TCP. Run `brine-sandbox --check` on any new machine, and don't use it there unless all required checks pass.
 - **macOS**: nono uses Seatbelt there instead of Landlock. Not tested yet, and `checks.mjs` assumes Linux.
 - **WSL2**: nono doesn't enforce network rules there. Don't use it.
 - **Nibi login nodes**: not tested. The kernel is older than 6.7, so expect the network checks to fail.
