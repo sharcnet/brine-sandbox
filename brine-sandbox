@@ -1,0 +1,65 @@
+#!/bin/sh
+# Run the Pi coding agent in a nono sandbox that can reach Brine and nothing else.
+# Usage, from your project directory:
+#   brine-sandbox [pi args...]   start Pi (e.g. -p "..." for one-shot)
+#   brine-sandbox --check        run the escape probes; every line must say PASS
+set -eu
+
+NONO_VERSION=0.82.0 # the version probes.sh last passed against; bump only after it passes again
+
+repo=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+config=${XDG_CONFIG_HOME:-$HOME/.config}/brine-sandbox
+state=${XDG_STATE_HOME:-$HOME/.local/state}/brine-sandbox
+keyfile=$config/brine.key
+here=$(pwd -P)
+
+die() { printf 'brine-sandbox: %s\n' "$*" >&2; exit 1; }
+
+command -v nono >/dev/null || die "nono not found on PATH. See the README for how to install nono $NONO_VERSION."
+have=$(nono --version | awk '{print $2}')
+[ "$have" = "$NONO_VERSION" ] || die "nono $have is installed, but brine-sandbox is tested against $NONO_VERSION. See 'Upgrading nono' in the README."
+[ -s "$keyfile" ] || die "no Brine key at $keyfile. See the README for setup."
+
+# The sandbox gets read/write on the current directory. Refuse any directory that would
+# hand it the key, the policy, this launcher, or your home directory.
+case $here in /|"$HOME") die "refusing to run in $here. cd into a project directory first." ;; esac
+for p in "$repo" "$config"; do
+  case $p/ in "$here"/*) die "refusing to run in $here: it contains $p." ;; esac
+  case $here/ in "$p"/*) die "refusing to run inside $p." ;; esac
+done
+
+# Find Pi's install. Pi's managed installer keeps releases under ~/.pi, which also holds
+# auth.json, so grant the current release only. Otherwise use the pi on PATH (e.g. npm).
+pi_home=$HOME/.pi/agent/install
+pi_node=${XDG_DATA_HOME:-$HOME/.local/share}/pi-node
+if [ -r "$pi_home/current-version" ]; then
+  pi_bin=$pi_home/releases/$(cat "$pi_home/current-version")/node_modules/.bin/pi
+  [ -x "$pi_node/current/bin/node" ] && PATH=$pi_node/current/bin:$PATH
+else
+  pi_bin=$(command -v pi) || die "pi not found. Install it from https://pi.dev first."
+fi
+pi_bin=$(readlink -f "$pi_bin")
+pi_root=${pi_bin%/node_modules/*}/node_modules
+[ -d "$pi_root" ] || die "can't work out where Pi is installed from $pi_bin."
+command -v node >/dev/null || die "node not found on PATH."
+
+# nono needs an absolute path for the key, so fill it into the profile here.
+# $config is never granted to the sandbox, so the agent can't edit the policy it runs under.
+mkdir -p "$config" "$state/pi"
+sed "s|@KEYFILE@|$keyfile|" "$repo/profile.json" >"$config/profile.json"
+
+[ -d "$pi_node" ] || pi_node=
+sandbox() {
+  exec nono run --profile "$config/profile.json" --allow-cwd --allow "$state/pi" --read "$pi_root" \
+    ${pi_node:+--read} ${pi_node:+"$pi_node"} "$@"
+}
+
+if [ "${1-}" = --check ]; then
+  export BRINE_SANDBOX_KEYFILE="$keyfile" BRINE_SANDBOX_CONFIG="$config" BRINE_SANDBOX_REPO="$repo"
+  sandbox -s --read-file "$repo/probes.sh" -- sh "$repo/probes.sh"
+fi
+
+# setup-pi.mjs runs inside the sandbox: it asks Brine (through nono) for the model list and
+# points Pi at this session's proxy port, then hands over to Pi.
+export PI_CODING_AGENT_DIR="$state/pi" PI_OFFLINE=1 PI_TELEMETRY=0
+sandbox --read-file "$repo/setup-pi.mjs" -- sh -c 'node "$0" && exec "$@"' "$repo/setup-pi.mjs" "$pi_bin" "$@"
